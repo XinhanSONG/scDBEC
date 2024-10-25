@@ -1,2 +1,2 @@
 # scDBEC
-Deep Learning Method for scRNA-seq Batch Effect Correction  
+Deep Learning Method for scRNA-seq Batch Effect Correction 
