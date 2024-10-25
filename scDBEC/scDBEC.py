@@ -1,4 +1,8 @@
 from sklearn.cluster import KMeans
+from scDBEC.preprocess import load_data
+import numpy as np
+from anndata import AnnData
+import scanpy as sc 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -111,9 +115,9 @@ class MMDLoss(nn.Module):
 
 
 class scDBEC(nn.Module):
-    def __init__(self, n_clusters=12, x=(10000, 1000)):
+    def __init__(self, adata, device = 'cuda', batch_size = 500,random_seed = 42, n_clusters=12,):
         super(scDBEC, self).__init__()
-        dims = getdims(x)
+        dims = getdims(adata.shape)
         input_dim = dims[0] 
         latent_dim = dims[-1]  
         hidden_dims = dims[1:-1]
@@ -157,7 +161,9 @@ class scDBEC(nn.Module):
         
         self.alpha = 1
         self.n_cluster = n_clusters
-        self.mu = torch.Tensor(n_clusters, latent_dim)
+        self.device = device
+        self.dataloaders = load_data(adata, batch_size=batch_size, device=device, seed = random_seed)
+        self.mu = torch.Tensor(n_clusters, latent_dim).to(self.device)
         self.zinb_loss = ZINBLoss()
         self.mmd_loss = MMDLoss()
         
@@ -192,14 +198,14 @@ class scDBEC(nn.Module):
             for batch in dataloader:
                 yield batch
 
-    def fit(self, adata, lambda1, lambda2, dataloaders, lr=1., batch_size=256, num_epochs=10, weight_decay=1e-2):
+    def fit(self, adata, lambda1, lambda2, lr=1., num_epochs=10, weight_decay=1e-2):
         use_cuda = torch.cuda.is_available()
         if use_cuda:
             self.cuda()
         
         optimizer = optim.Adam(filter(lambda p: p.requires_grad, self.parameters()), lr=lr, weight_decay=weight_decay)
 
-        cyclers = {batch_name: self.cycle(dl) for batch_name, dl in dataloaders.items()}
+        cyclers = {batch_name: self.cycle(dl) for batch_name, dl in self.dataloaders.items()}
 
         # KMeans Initialization
         kmeans = KMeans(self.n_cluster, n_init=20)
@@ -214,8 +220,8 @@ class scDBEC(nn.Module):
             mmd_loss_val = 0
             kl_loss_val = 0
 
-            start_idxs = {batch_name: 0 for batch_name in dataloaders}
-            max_len = max(len(dl) for dl in dataloaders.values())
+            start_idxs = {batch_name: 0 for batch_name in self.dataloaders}
+            max_len = max(len(dl) for dl in self.dataloaders.values())
 
             for batch_idx in range(max_len):
                 inputs_list = []
@@ -254,3 +260,22 @@ class scDBEC(nn.Module):
                 kl_loss_val += kl_loss.data.item() * len(inputs_list[0])
                 total_samples += len(inputs_list[0])
             logging.info(f"End of Epoch {epoch}: Avg Recon Loss: {recon_loss_val / total_samples:.4f}, Avg MMD Loss: {lambda1*mmd_loss_val / total_samples:.4f}, Avg KL Loss: {lambda2*kl_loss_val / total_samples:.4f}")
+
+    def latent_output(self, adata):
+        batches = {}
+        for batch_label in np.unique(adata.obs.BATCH):
+            batches[batch_label] = adata[adata.obs.BATCH == batch_label]
+        z_values = {}
+
+        for batch_label, batch_data in batches.items():
+            batch_tensor = torch.tensor(batch_data.X, dtype=torch.float32).to(self.device)
+            z, _, _, _, _ = self.forward(batch_tensor)
+            z_values[batch_label] = z.cpu().detach().numpy()
+
+        all_z = np.concatenate([z for z in z_values.values()], axis=0)
+        X_umap = AnnData(all_z)
+        
+        all_batches = sc.AnnData.concatenate(*batches.values())
+        X_umap.obs["BATCH"] = list(all_batches.obs.BATCH)
+        X_umap.obs["celltype"] = list(all_batches.obs.celltype)
+        return X_umap

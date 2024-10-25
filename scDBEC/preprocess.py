@@ -1,5 +1,7 @@
 import numpy as np
 import scanpy as sc 
+import torch
+from torch.utils.data import DataLoader
 
 def preprocess(adata, target_sum=1e4, n_top_genes=1000, max_value=1.0):
     """
@@ -34,3 +36,19 @@ def preprocess(adata, target_sum=1e4, n_top_genes=1000, max_value=1.0):
     adata_processed = sc.AnnData.concatenate(*adata_sep)
     
     return adata_processed
+
+def load_data(adata, device='cuda', batch_size=500, seed=42):
+    # random seed
+    torch.manual_seed(seed)
+    np.random.seed(seed)
+
+    batches = {}
+    for batch_label in np.unique(adata.obs.BATCH):
+        batches[batch_label] = adata[adata.obs.BATCH == batch_label]
+    
+    dataloaders = {}
+    for batch_label, batch_data in batches.items():
+        dataset = torch.tensor(batch_data.X, dtype=torch.float32).to(device)
+        dataloaders[batch_label] = DataLoader(dataset, batch_size=batch_size, shuffle=True)
+    
+    return dataloaders
