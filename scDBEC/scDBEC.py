@@ -8,6 +8,9 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
 import logging
+from sklearn.metrics import pairwise_distances
+from scipy.spatial.distance import squareform
+from sklearn.manifold._t_sne import _joint_probabilities
 
 def getdims(x=(10000,200)):
     """
@@ -16,10 +19,10 @@ def getdims(x=(10000,200)):
     """
     assert len(x)==2
     n_sample=x[0]
-    if n_sample>20000:# may be need complex network
-        dims=[x[-1],128,32]
+    if n_sample>25000:# may be need complex network
+        dims=[x[-1],256,128]
     elif n_sample>10000:#10000
-        dims=[x[-1],64,32]
+        dims=[x[-1],128,32]
     elif n_sample>5000: #5000
         dims=[x[-1],32,16] #16
     elif n_sample>2000:
@@ -29,6 +32,57 @@ def getdims(x=(10000,200)):
     else:
         dims=[x[-1],16]
     return dims
+
+def generate_P(X, device, perplexity=30):
+    """
+    Generate the probability distribution matrix P.
+    :param X: Input data (torch.Tensor)
+    :param device: Device (str, e.g., 'cpu' or 'cuda')
+    :param perplexity: Desired perplexity (int)
+    :return: Probability distribution matrix P (torch.Tensor)
+    """
+    distances = pairwise_distances(X.detach().cpu().numpy(), metric='euclidean', squared=True)
+    P = _joint_probabilities(distances=distances, desired_perplexity=perplexity, verbose=False)
+    P_hat = squareform(P)
+    return torch.tensor(P_hat, device=device)
+
+def generate_Q(Z, device):
+    """
+    Generate the probability distribution matrix Q.
+    :param Z: Embedded representations (torch.Tensor)
+    :param device: Device (str, e.g., 'cpu' or 'cuda')
+    :return: Probability distribution matrix Q (torch.Tensor)
+    """
+    Z = Z.detach().cpu().numpy()
+    distance_matrix = pairwise_distances(Z, metric='euclidean', squared=True)
+    inverse = 1 / (distance_matrix + 1)
+    np.fill_diagonal(inverse, 0)  # Set diagonal elements to 0 more concisely
+    inverse_sum = np.sum(inverse)  # Simplify normalization calculation
+    Q_normalized = inverse / inverse_sum
+    return torch.tensor(Q_normalized, device=device)
+
+class KLLoss(torch.nn.Module):
+    """
+    Compute the Kullback-Leibler (KL) divergence between two probability distributions.
+    """
+    def __init__(self):
+        super(KLLoss, self).__init__()
+
+    def forward(self, P: torch.Tensor, Q: torch.Tensor) -> torch.Tensor:
+        """
+        Compute KL divergence between two probability distributions.
+
+        :param P: Pairwise similarity matrix for high-dimensional space (torch.Tensor) of shape (n, n).
+        :param Q: Pairwise similarity matrix for low-dimensional space (torch.Tensor) of shape (n, n).
+        :return: KL divergence (torch.Tensor) as a scalar value.
+        """
+        # Avoid log(0) by adding a small epsilon
+        epsilon = 1e-12
+        P = torch.clamp(P, epsilon, 1.0)
+        Q = torch.clamp(Q, epsilon, 1.0)
+        # Compute element-wise KL divergence
+        kl_divergence = torch.sum(P * torch.log(P / Q))
+        return kl_divergence
 
 # Set up logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -73,49 +127,54 @@ class ZINBLoss(nn.Module):
         return result
 
 class MMDLoss(nn.Module):
-    def __init__(self, kernel_type='rbf', kernel_mul=2.0, kernel_num=12, fix_sigma=1):
+    def __init__(self, kernel_type='rbf', kernel_mul=2.0, kernel_num=5, fix_sigma=1, **kwargs):
         super(MMDLoss, self).__init__()
-        self.kernel_type = kernel_type
-        self.kernel_mul = kernel_mul
         self.kernel_num = kernel_num
+        self.kernel_mul = kernel_mul
         self.fix_sigma = fix_sigma
+        self.kernel_type = kernel_type
 
-    def gaussian_kernel(self, source, target):
-        n_samples = source.size(0) + target.size(0)
+    def guassian_kernel(self, source, target, kernel_mul, kernel_num, fix_sigma):
+        n_samples = int(source.size()[0]) + int(target.size()[0])
         total = torch.cat([source, target], dim=0)
-        L2_distance = ((total.unsqueeze(0) - total.unsqueeze(1)) ** 2).sum(2)
-
-        if self.fix_sigma:
-            bandwidth = self.fix_sigma
+        total0 = total.unsqueeze(0).expand(
+            int(total.size(0)), int(total.size(0)), int(total.size(1)))
+        total1 = total.unsqueeze(1).expand(
+            int(total.size(0)), int(total.size(0)), int(total.size(1)))
+        L2_distance = ((total0-total1)**2).sum(2)
+        if fix_sigma:
+            bandwidth = fix_sigma
         else:
-            bandwidth = torch.sum(L2_distance) / (n_samples ** 2 - n_samples)
-        bandwidth /= self.kernel_mul ** (self.kernel_num // 2)
-        bandwidth_list = [bandwidth * (self.kernel_mul ** i) for i in range(self.kernel_num)]
-
-        kernel_val = [torch.exp(-L2_distance / bw) for bw in bandwidth_list]
-        #print(bandwidth)
+            bandwidth = torch.sum(L2_distance.data) / (n_samples**2-n_samples)
+        bandwidth /= kernel_mul ** (kernel_num // 2)
+        bandwidth_list = [bandwidth * (kernel_mul**i)
+                          for i in range(kernel_num)]
+        kernel_val = [torch.exp(-L2_distance / bandwidth_temp)
+                      for bandwidth_temp in bandwidth_list]
         return sum(kernel_val)
 
-    def linear_mmd2(self, source, target):
-        delta = source.mean(0) - target.mean(0)
-        loss = torch.dot(delta, delta)
+    def linear_mmd2(self, f_of_X, f_of_Y):
+        loss = 0.0
+        delta = f_of_X.float().mean(0) - f_of_Y.float().mean(0)
+        loss = delta.dot(delta.T)
         return loss
 
     def forward(self, source, target):
         if self.kernel_type == 'linear':
             return self.linear_mmd2(source, target)
         elif self.kernel_type == 'rbf':
-            batch_size = source.size(0)
-            kernels = self.gaussian_kernel(source, target)
-            XX = kernels[:batch_size, :batch_size].mean()
-            YY = kernels[batch_size:, batch_size:].mean()
-            XY = kernels[:batch_size, batch_size:].mean()
-            loss = XX + YY - 2 * XY
+            batch_size = int(source.size()[0])
+            kernels = self.guassian_kernel(
+                source, target, kernel_mul=self.kernel_mul, kernel_num=self.kernel_num, fix_sigma=self.fix_sigma)
+            XX = torch.mean(kernels[:batch_size, :batch_size])
+            YY = torch.mean(kernels[batch_size:, batch_size:])
+            XY = torch.mean(kernels[:batch_size, batch_size:])
+            YX = torch.mean(kernels[batch_size:, :batch_size])
+            loss = torch.mean(XX + YY - XY - YX)
             return loss
 
-
 class scDBEC(nn.Module):
-    def __init__(self, adata, device = 'cuda', batch_size = 500,random_seed = 42, n_clusters=12,):
+    def __init__(self, adata, device = 'cuda', batch_size = 500,random_seed = 42,fix_sigma = 1,):
         super(scDBEC, self).__init__()
         dims = getdims(adata.shape)
         input_dim = dims[0] 
@@ -159,39 +218,37 @@ class scDBEC(nn.Module):
             nn.Sigmoid()
         )
         
-        self.alpha = 1
-        self.n_cluster = n_clusters
         self.device = device
         self.dataloaders = load_data(adata, batch_size=batch_size, device=device, seed = random_seed)
-        self.mu = torch.Tensor(n_clusters, latent_dim).to(self.device)
+        # self.mu = torch.Tensor(n_clusters, latent_dim).to(self.device)
+        self.kl_loss = KLLoss()
         self.zinb_loss = ZINBLoss()
-        self.mmd_loss = MMDLoss()
-        
+        self.mmd_loss = MMDLoss(fix_sigma=fix_sigma)
 
-    def soft_assign(self, z):
-        q = 1.0 / (1.0 + torch.sum((z.unsqueeze(1) - self.mu)**2, dim=2) / self.alpha)
-        q = q**((self.alpha + 1.0) / 2.0)
-        q = (q.t() / torch.sum(q, dim=1)).t()
-        return q
+    # def soft_assign(self, z):
+    #     q = 1.0 / (1.0 + torch.sum((z.unsqueeze(1) - self.mu)**2, dim=2) / self.alpha)
+    #     q = q**((self.alpha + 1.0) / 2.0)
+    #     q = (q.t() / torch.sum(q, dim=1)).t()
+    #     return q
     
-    def target_distribution(self, q):
-        p = q**2 / (q.sum(0)+ 1e-10)
-        return (p.t() / (p.sum(1)+1e-10)).t()
+    # def target_distribution(self, q):
+    #     p = q**2 / (q.sum(0)+ 1e-10)
+    #     return (p.t() / (p.sum(1)+1e-10)).t()
     
     def forward(self, x):
         h = self.encoder(x)
         z = self._enc_mu(h)
         h_dec = self.decoder(z)
-        q = self.soft_assign(z)  
+        #q = self.soft_assign(z)  
         mean = self._dec_mean(h_dec)
         disp = self._dec_disp(h_dec)
         pi = self._dec_pi(h_dec)
-        return z, q, mean, disp, pi
+        return z, mean, disp, pi
     
-    def kl_loss(self, p, q):
-        p = torch.clamp(p, min=1e-10)
-        q = torch.clamp(q, min=1e-10)
-        return torch.mean(torch.sum(p * torch.log(p / q), dim=-1))
+    # def kl_loss(self, p, q):
+    #     p = torch.clamp(p, min=1e-10)
+    #     q = torch.clamp(q, min=1e-10)
+    #     return torch.mean(torch.sum(p * torch.log(p / q), dim=-1))
   
     def cycle(self, dataloader):
         while True:
@@ -207,11 +264,11 @@ class scDBEC(nn.Module):
 
         cyclers = {batch_name: self.cycle(dl) for batch_name, dl in self.dataloaders.items()}
 
-        # KMeans Initialization
-        kmeans = KMeans(self.n_cluster, n_init=20)
-        data = self._enc_mu(self.encoder(torch.tensor(adata.X, dtype=torch.float32).cuda()))
-        kmeans.fit(data.cpu().detach().numpy())
-        self.mu.data.copy_(torch.tensor(kmeans.cluster_centers_, device=self.mu.device))
+        # # KMeans Initialization
+        # kmeans = KMeans(self.n_cluster, n_init=20)
+        # data = self._enc_mu(self.encoder(torch.tensor(adata.X, dtype=torch.float32).cuda()))
+        # kmeans.fit(data.cpu().detach().numpy())
+        # self.mu.data.copy_(torch.tensor(kmeans.cluster_centers_, device=self.mu.device))
 
         self.train()
         for epoch in range(num_epochs):
@@ -226,27 +283,34 @@ class scDBEC(nn.Module):
             for batch_idx in range(max_len):
                 inputs_list = []
                 z_list = []
-                q_list = []
+                #q_list = []
+                kl_loss_list = []
                 recon_loss_list = []
                 
                 for batch_name, cycler in cyclers.items():
-                    inputs = next(cycler).cuda()
+                    inputs = next(cycler).to(self.device)
                     inputs.requires_grad_(True)
-                    z, q, mean, disp, pi = self.forward(inputs)
+                    z, mean, disp, pi = self.forward(inputs)
                     
-                    p_sub = self.target_distribution(q).data[start_idxs[batch_name]:start_idxs[batch_name] + q.shape[0]]
-                    start_idxs[batch_name] = 0 if start_idxs[batch_name] + q.shape[0] == p_sub.shape[0] else start_idxs[batch_name] + q.shape[0]
+                    # p_sub = self.target_distribution(q).data[start_idxs[batch_name]:start_idxs[batch_name] + q.shape[0]]
+                    # start_idxs[batch_name] = 0 if start_idxs[batch_name] + q.shape[0] == p_sub.shape[0] else start_idxs[batch_name] + q.shape[0]
+                    # Compute adjacency matrix P and KL loss
+                    P = generate_P(inputs, device=self.device)
+                    Q = generate_Q(z, device=self.device)
+                    kl_loss = self.kl_loss(P, Q)
                     
                     recon_loss = self.zinb_loss(inputs, mean, disp, pi)
                     
                     inputs_list.append(inputs)
                     z_list.append(z)
-                    q_list.append(q)
+                    #q_list.append(q)
+                    kl_loss_list.append(kl_loss)
                     recon_loss_list.append(recon_loss)
                 
                 recon_loss = sum(recon_loss_list)
 
-                kl_loss = sum(self.kl_loss(self.target_distribution(q), q) for q in q_list)
+                # kl_loss = sum(self.kl_loss(self.target_distribution(q), q) for q in q_list)
+                kl_loss = sum(kl_loss_list)
                 mmd_loss = sum(self.mmd_loss(z_list[i], z_list[j]) for i in range(len(z_list)) for j in range(i + 1, len(z_list)))
                 total_loss = recon_loss + lambda1*mmd_loss + lambda2*kl_loss
 
@@ -269,7 +333,7 @@ class scDBEC(nn.Module):
 
         for batch_label, batch_data in batches.items():
             batch_tensor = torch.tensor(batch_data.X, dtype=torch.float32).to(self.device)
-            z, _, _, _, _ = self.forward(batch_tensor)
+            z, _, _, _ = self.forward(batch_tensor)
             z_values[batch_label] = z.cpu().detach().numpy()
 
         all_z = np.concatenate([z for z in z_values.values()], axis=0)
@@ -278,4 +342,5 @@ class scDBEC(nn.Module):
         all_batches = sc.AnnData.concatenate(*batches.values())
         X_umap.obs["BATCH"] = list(all_batches.obs.BATCH)
         X_umap.obs["celltype"] = list(all_batches.obs.celltype)
+
         return X_umap
