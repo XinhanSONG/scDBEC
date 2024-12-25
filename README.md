@@ -8,7 +8,9 @@ The model utilizes an ZINB model -based autoencoder guided by three integrated l
 - **Clustering Loss**: Captures local relationships by minimizing divergence between high- and low-dimensional affinity matrices.  
 - **MMD Loss**: Aligns latent space representations across batches, correcting for batch effects effectively.  
 
-For a detailed description of the implementation and to reproduce the results presented in our manuscript, please visit the GitHub repository: [https://github.com/XinhanSONG/scDBEC](#).
+For a detailed description of the implementation please visit the GitHub file: [https://github.com/XinhanSONG/scDBEC/scDBEC/scDBEC.py](#).
+
+![image](https://github.com/XinhanSONG/scDBEC/blob/main/Overview.png)
 
 ### Dependency & Installation 
 The programs require a PyTorch environment and the following dependencies to be installed:  
