@@ -29,7 +29,7 @@ The programs require a PyTorch environment and the following dependencies to be 
 Ensure you have Python 3.8.19 installed. Create and activate a virtual environment. Follow the steps below to set up the environment and install the required dependencies for **scDBEC**:  
 
 ```bash  
-git clone https://github.com/username/scDBEC  
+git clone https://github.com/XinhanSONG/scDBEC  
 python3 -m venv scdbec_env  
 pip install -r requirements.txt  
 # Check that all packages are installed correctly:  
